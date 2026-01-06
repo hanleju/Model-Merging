@@ -1,17 +1,15 @@
 import torch
-import gc
-import os
-from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM, AutoConfig
+from transformers import PaliGemmaProcessor, PaliGemmaForConditionalGeneration
 
 # =========================================================
 # 1. 모델 설정 (수정됨)
 # =========================================================
-# Qwen-VL 시리즈: 같은 구조, 다른 task 특화
-base_model_id = "Qwen/Qwen-VL"                       # Base Model (일반 Vision-Language)
-model_a_id = "Qwen/Qwen-VL-Chat"                     # Task A: 대화 특화 (instruction-following)
-model_b_id = "Qwen/Qwen-VL"                          # Task B: 일반 vision 이해
+# Base를 Pretrain으로 사용, 두 개의 서로 다른 task 병합
+base_model_id = "google/paligemma-3b-pt-224"           # Pre-trained Base
+model_a_id = "NYUAD-ComNets/FaceScanPaliGemma_Race"    # Task A: 인종 분류
+model_b_id = "NYUAD-ComNets/FaceScanPaliGemma_Age"     # Task B: 나이 그룹 분류
 
-output_path = "./cpu_merged_vlm_ties"
+output_path = "./weights/paligemma_race_age"
 
 # =========================================================
 # 2. TiES-Merging 함수 (VLM 특화 수정)
@@ -95,20 +93,20 @@ print("Loading models... (This requires high RAM)")
 
 # 1. Base Model 로드
 print(f"Loading Base: {base_model_id}")
-base_model = AutoModelForCausalLM.from_pretrained(
-    base_model_id, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+base_model = PaliGemmaForConditionalGeneration.from_pretrained(
+    base_model_id, dtype=torch.bfloat16, device_map="cpu"
 )
 
 # 2. Model A 로드
 print(f"Loading Model A: {model_a_id}")
-model_a = AutoModelForCausalLM.from_pretrained(
-    model_a_id, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+model_a = PaliGemmaForConditionalGeneration.from_pretrained(
+    model_a_id, dtype=torch.bfloat16, device_map="cpu"
 )
 
 # 3. Model B 로드
 print(f"Loading Model B: {model_b_id}")
-model_b = AutoModelForCausalLM.from_pretrained(
-    model_b_id, torch_dtype=torch.float16, device_map="cpu", trust_remote_code=True
+model_b = PaliGemmaForConditionalGeneration.from_pretrained(
+    model_b_id, dtype=torch.bfloat16, device_map="cpu"
 )
 
 # 4. 병합 실행
@@ -123,12 +121,9 @@ base_model.load_state_dict(final_state_dict)
 print(f"Saving to {output_path}...")
 base_model.save_pretrained(output_path)
 
-# Processor/Tokenizer 복사 (중요: Chat 버전 사용)
-print("Saving processor from Model A (Qwen-VL-Chat)...")
-processor = AutoProcessor.from_pretrained(model_a_id, trust_remote_code=True)
+# Processor 복사 (Base 사용)
+print("Saving processor from Base (PaliGemma-PT-224)...")
+processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224", use_fast=True)
 processor.save_pretrained(output_path)
-
-tokenizer = AutoTokenizer.from_pretrained(model_a_id, trust_remote_code=True)
-tokenizer.save_pretrained(output_path)
 
 print("✅ Merging Complete!")

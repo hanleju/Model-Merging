@@ -223,7 +223,7 @@ def merge_paligemma_vlm(
     alpha2: float = None,
     density: float = 0.3,
     layerswap_base_layer_num: int = -1,
-    device: str = "cpu",
+    device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16
 ):
     """
@@ -398,33 +398,7 @@ def extract_layer_number(key: str) -> int:
 def main():
     parser = argparse.ArgumentParser(
         description="VLM Merging for PaliGemma (ICML 2025 Method)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # TIES Merging (recommended)
-  python merge_vlm.py \\
-    --base_model google/paligemma-3b-pt-224 \\
-    --model_a NYUAD-ComNets/FaceScanPaliGemma_Race \\
-    --model_b NYUAD-ComNets/FaceScanPaliGemma_Age \\
-    --output ./weights/merged_ties \\
-    --mode ties --alpha 1.0 --alpha2 1.0 --density 0.3
-
-  # DARE-TIES Merging
-  python merge_vlm.py \\
-    --base_model google/paligemma-3b-pt-224 \\
-    --model_a NYUAD-ComNets/FaceScanPaliGemma_Race \\
-    --model_b NYUAD-ComNets/FaceScanPaliGemma_Age \\
-    --output ./weights/merged_dare \\
-    --mode dareties --alpha 1.2 --density 0.2
-
-  # Simple weighted average
-  python merge_vlm.py \\
-    --base_model google/paligemma-3b-pt-224 \\
-    --model_a NYUAD-ComNets/FaceScanPaliGemma_Race \\
-    --model_b NYUAD-ComNets/FaceScanPaliGemma_Age \\
-    --output ./weights/merged_base \\
-    --mode base --alpha 0.5
-        """
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     # Required arguments

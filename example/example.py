@@ -19,7 +19,7 @@ model_path = "NYUAD-ComNets/FaceScanPaliGemma_Age"
 
 print(f"Loading model: {model_path}...")
 model = PaliGemmaForConditionalGeneration.from_pretrained(
-    model_path, 
+    model_path,
     dtype=torch.bfloat16
 )
 processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224", use_fast=True)

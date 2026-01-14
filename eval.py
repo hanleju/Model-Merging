@@ -154,7 +154,8 @@ def evaluate_model(
     attributes: List[str],
     trained_objects: List[str],
     device: str = "cuda",
-    max_samples: int = None
+    max_samples: int = None,
+    output_file: str = None
 ) -> Dict[str, float]:
     """Evaluate model on FairFace dataset."""
     if max_samples:
@@ -185,14 +186,16 @@ def evaluate_model(
             if idx < 3:
                 print(f"[Sample {idx+1}] {attr.upper()}: GT={gt_label}, Pred={pred_normalized} {'✓' if is_correct else '✗'}")
     
-    return compute_accuracy(results)
+    return compute_accuracy(results, output_file)
 
 
-def compute_accuracy(results: Dict[str, Dict[str, int]]) -> Dict[str, float]:
+def compute_accuracy(results: Dict[str, Dict[str, int]], output_file: str = None) -> Dict[str, float]:
     """Calculate and display accuracy metrics."""
-    print("\n" + "="*60)
-    print("📊 EVALUATION RESULTS")
-    print("="*60)
+    output_lines = []
+    
+    header = "\n" + "="*60 + "\n" + "📊 EVALUATION RESULTS" + "\n" + "="*60
+    print(header)
+    output_lines.append(header)
     
     accuracies = {}
     total_correct = 0
@@ -202,18 +205,34 @@ def compute_accuracy(results: Dict[str, Dict[str, int]]) -> Dict[str, float]:
         if res["total"] > 0:
             acc = res["correct"] / res["total"] * 100
             accuracies[attr] = acc
-            print(f"{attr.upper():8s}: {acc:6.2f}% ({res['correct']}/{res['total']})")
+            line = f"{attr.upper():8s}: {acc:6.2f}% ({res['correct']}/{res['total']})"
+            print(line)
+            output_lines.append(line)
             total_correct += res["correct"]
             total_samples += res["total"]
         else:
             accuracies[attr] = 0.0
-            print(f"{attr.upper():8s}: N/A")
+            line = f"{attr.upper():8s}: N/A"
+            print(line)
+            output_lines.append(line)
     
     if total_samples > 0:
         overall_acc = total_correct / total_samples * 100
-        print(f"\nOVERALL : {overall_acc:6.2f}% ({total_correct}/{total_samples})")
+        line = f"\nOVERALL : {overall_acc:6.2f}% ({total_correct}/{total_samples})"
+        print(line)
+        output_lines.append(line)
     
-    print("="*60)
+    footer = "="*60
+    print(footer)
+    output_lines.append(footer)
+    
+    # Save to file if output_file is specified
+    if output_file:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("\n".join(output_lines))
+        print(f"\n💾 Results saved to: {output_file}")
+    
     return accuracies
 
 
@@ -240,6 +259,8 @@ def main():
                        help="Maximum number of samples to evaluate (default: all)")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use (default: cuda)")
+    parser.add_argument("--output", type=str, default="output",
+                       help="Output directory for results (default: output)")
     
     args = parser.parse_args()
     
@@ -268,6 +289,10 @@ def main():
     # Load data
     data_df = load_fairface_data(args.data_dir, args.split)
     
+    # Prepare output file path
+    model_name = args.model_path.replace('/', '_').replace('\\', '_')
+    output_file = os.path.join(args.output, f"eval_{model_name}_{args.split}.txt")
+    
     # Evaluate
     accuracies = evaluate_model(
         model=model,
@@ -276,7 +301,8 @@ def main():
         attributes=args.attributes,
         trained_objects=args.object,
         device=args.device,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        output_file=output_file
     )
     
     print("\n✅ Evaluation complete!")

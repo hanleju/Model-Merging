@@ -19,23 +19,14 @@ from typing import Dict, List
 
 AGE_GROUPS = ['0-2', '3-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70+']
 GENDERS = ['Male', 'Female']
-RACES = ['White', 'Black', 'Latino_Hispanic', 'East Asian', 'Southeast Asian', 'Indian', 'Middle Eastern']
+# Fair_RACES = ['White', 'Black', 'Latino_Hispanic', 'East Asian', 'Southeast Asian', 'Indian', 'Middle Eastern']
+UTK_RACES = ['White', 'Black', 'East Asian', 'Indian', 'Others']
 
 PROMPT_TEMPLATES = {
-    'age': {
-        'simple': 'age group',
-        'detailed': 'What is the age group of the person? Answer: 0-2, 3-9, 10-19, 20-29, 30-39, 40-49, 50-59, 60-69, or 70+.'
-    },
-    'gender': {
-        'simple': 'gender',
-        'detailed': 'What is the gender of the person? Answer: Male or Female.'
-    },
-    'race': {
-        'simple': 'race',
-        'detailed': 'What is the race of the person? Answer: White, Black, Latino_Hispanic, East Asian, Southeast Asian, Indian, or Middle Eastern.'
-    }
+    'age':'<image>What is the age group of the person?',
+    'gender': '<image>What is the gender of the person?',
+    'race': '<image>What is the race of the person?'
 }
-
 
 # =========================================================
 # Model Functions
@@ -47,13 +38,19 @@ def load_model_and_processor(model_path: str, device: str = "cuda"):
     
     model = PaliGemmaForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device
     )
     model.eval()
     
-    processor = PaliGemmaProcessor.from_pretrained(model_path)
-    print("✅ Model loaded successfully!\n")
+    try:
+        processor = PaliGemmaProcessor.from_pretrained(model_path, use_fast=True)
+        print("✅ Model loaded successfully!\n")
+    except (OSError, ValueError) as e:
+        print("⚠️  Processor not found in model, using base PaliGemma processor...")
+        base_processor_path = "google/paligemma-3b-pt-224"
+        processor = PaliGemmaProcessor.from_pretrained(base_processor_path, use_fast=True)
+        print("✅ Model and base processor loaded successfully!\n")
     
     return model, processor
 
@@ -80,44 +77,61 @@ def load_fairface_data(data_dir: str, split: str = "val") -> pd.DataFrame:
 # Prediction Functions
 # =========================================================
 
-def get_prompt(attribute: str, trained_objects: List[str]) -> str:
-    """Generate appropriate prompt based on model training."""
-    if len(trained_objects) == 1:
-        return PROMPT_TEMPLATES[attribute]['simple']
-    else:
-        return PROMPT_TEMPLATES[attribute]['detailed']
-
-
 def predict_attribute(
     model,
     processor,
     image: Image.Image,
     attribute: str,
-    trained_objects: List[str],
     device: str = "cuda"
 ) -> str:
     """Predict a single attribute for an image."""
-    prompt = get_prompt(attribute, trained_objects)
-    
+    prompt = PROMPT_TEMPLATES[attribute]
+
     inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
     
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=20, do_sample=False)
     
     generated_text = processor.decode(outputs[0], skip_special_tokens=True)
-    answer = generated_text.replace(prompt, "").strip()
+    # Remove the prompt from generated text (without <image> token)
+    prompt_without_image = prompt.replace("<image>", "")
+    answer = generated_text.replace(prompt_without_image, "").strip()
     
     return answer
 
 
-def normalize_answer(answer: str, attribute: str) -> str:
+def normalize_answer(answer: str, attribute: str, gt_label: str = None) -> str:
     """Normalize model output to match ground truth format."""
     answer = answer.strip().lower()
     
     if attribute == "age":
+        # Try to match exact age group first
         for age_group in AGE_GROUPS:
             if age_group.lower() in answer:
                 return age_group
+        
+        # Handle "from X to Y" format
+        import re
+        match = re.search(r'from\s+(\d+)\s+to\s+(\d+)', answer)
+        if match and gt_label:
+            pred_start = int(match.group(1))
+            pred_end = int(match.group(2))
+            
+            # Parse ground truth range
+            gt_match = re.match(r'(\d+)-(\d+|\+)', gt_label)
+            if gt_match:
+                gt_start = int(gt_match.group(1))
+                gt_end = gt_match.group(2)
+                
+                if gt_end == '+':
+                    # Handle "70+" case
+                    if pred_start >= gt_start:
+                        return gt_label
+                else:
+                    gt_end = int(gt_end)
+                    # Check if predicted range overlaps with ground truth
+                    if pred_start <= gt_end and pred_end >= gt_start:
+                        return gt_label
     
     elif attribute == "gender":
         if "male" in answer and "female" not in answer:
@@ -152,7 +166,6 @@ def evaluate_model(
     processor,
     data_df: pd.DataFrame,
     attributes: List[str],
-    trained_objects: List[str],
     device: str = "cuda",
     max_samples: int = None,
     output_file: str = None
@@ -175,8 +188,8 @@ def evaluate_model(
         
         for attr in attributes:
             gt_label = row[attr]
-            pred = predict_attribute(model, processor, image, attr, trained_objects, device)
-            pred_normalized = normalize_answer(pred, attr)
+            pred = predict_attribute(model, processor, image, attr, device)
+            pred_normalized = normalize_answer(pred, attr, gt_label)
             
             is_correct = (pred_normalized == gt_label)
             results[attr]["correct"] += int(is_correct)
@@ -249,12 +262,9 @@ def main():
                        help="Root directory of FairFace dataset")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val"],
                        help="Dataset split to evaluate (default: val)")
-    parser.add_argument("--object", type=str, nargs="+", default=["age", "gender", "race"],
+    parser.add_argument("--attributes", type=str, nargs="+", default=["age", "gender", "race"],
                        choices=["age", "gender", "race"],
-                       help="Objects the model was trained on (default: age gender race)")
-    parser.add_argument("--attributes", type=str, nargs="+", default=None,
-                       choices=["age", "gender", "race"],
-                       help="Attributes to evaluate (default: same as --object)")
+                       help="Attributes to evaluate (default: age gender race)")
     parser.add_argument("--max_samples", type=int, default=None,
                        help="Maximum number of samples to evaluate (default: all)")
     parser.add_argument("--device", type=str, default="cuda",
@@ -263,10 +273,6 @@ def main():
                        help="Output directory for results (default: output)")
     
     args = parser.parse_args()
-    
-    # Default attributes to trained objects
-    if args.attributes is None:
-        args.attributes = args.object
     
     # Check device availability
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -278,7 +284,6 @@ def main():
     print(f"Model      : {args.model_path}")
     print(f"Data       : {args.data_dir}")
     print(f"Split      : {args.split}")
-    print(f"Trained on : {', '.join(args.object)}")
     print(f"Evaluating : {', '.join(args.attributes)}")
     print(f"Device     : {args.device}")
     print("="*60 + "\n")
@@ -299,7 +304,6 @@ def main():
         processor=processor,
         data_df=data_df,
         attributes=args.attributes,
-        trained_objects=args.object,
         device=args.device,
         max_samples=args.max_samples,
         output_file=output_file

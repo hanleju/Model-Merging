@@ -1,4 +1,6 @@
 *.jpg
 *.png
+*.bat
 
 weights/*
+results/*

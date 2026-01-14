@@ -249,17 +249,17 @@ def merge_paligemma_vlm(
     # Load models
     print(f"📥 Loading Base Model: {base_model_path}")
     base_model = PaliGemmaForConditionalGeneration.from_pretrained(
-        base_model_path, torch_dtype=dtype, device_map=device
+        base_model_path, dtype=dtype, device_map=device
     )
     
     print(f"📥 Loading Model A: {model_a_path}")
     model_a = PaliGemmaForConditionalGeneration.from_pretrained(
-        model_a_path, torch_dtype=dtype, device_map=device
+        model_a_path, dtype=dtype, device_map=device
     )
     
     print(f"📥 Loading Model B: {model_b_path}")
     model_b = PaliGemmaForConditionalGeneration.from_pretrained(
-        model_b_path, torch_dtype=dtype, device_map=device
+        model_b_path, dtype=dtype, device_map=device
     )
     
     # Get state dicts

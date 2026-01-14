@@ -180,9 +180,24 @@ def perform_z_test(group1: List[float], group2: List[float]) -> float:
     mean1, mean2 = np.mean(group1), np.mean(group2)
     std1, std2 = np.std(group1, ddof=1), np.std(group2, ddof=1)
     n1, n2 = len(group1), len(group2)
+    
     pooled_se = np.sqrt(std1**2/n1 + std2**2/n2)
+    
+    # Handle case when pooled_se is 0 or very small
+    if pooled_se < 1e-10:
+        # If means are different, return very small p-value, otherwise large p-value
+        if abs(mean1 - mean2) > 1e-10:
+            return 0.0
+        else:
+            return 1.0
+    
     z = (mean1 - mean2) / pooled_se
     p_value = norm.sf(z)
+    
+    # Handle NaN or infinite values
+    if np.isnan(p_value) or np.isinf(p_value):
+        return 0.5  # Return neutral value
+    
     return p_value
 
 
@@ -222,14 +237,29 @@ def target_only_inference(
         label_list.append(1)  # Non-member label
     
     # Calculate AUC
-    auc = roc_auc_score(label_list, p_list)
+    p_array = np.array(p_list)
+    label_array = np.array(label_list)
+    
+    # Check for NaN values
+    valid_mask = ~np.isnan(p_array)
+    if valid_mask.sum() < len(p_array):
+        print(f"⚠️  Warning: {(~valid_mask).sum()} NaN values detected and removed")
+        p_array = p_array[valid_mask]
+        label_array = label_array[valid_mask]
+    
+    # Check if we have enough valid samples
+    if len(p_array) < 10:
+        print("❌ Error: Too few valid samples for evaluation")
+        return 0.5, 0.5, 0.0
+    
+    auc = roc_auc_score(label_array, p_array)
     
     # Calculate Attack Accuracy (using optimal threshold)
-    fpr, tpr, thresholds = roc_curve(label_list, p_list)
+    fpr, tpr, thresholds = roc_curve(label_array, p_array)
     optimal_idx = np.argmax(tpr - fpr)
     optimal_threshold = thresholds[optimal_idx]
-    predictions = [1 if p >= optimal_threshold else 0 for p in p_list]
-    attack_acc = accuracy_score(label_list, predictions)
+    predictions = [1 if p >= optimal_threshold else 0 for p in p_array]
+    attack_acc = accuracy_score(label_array, predictions)
     
     # Calculate TPR@5%FPR
     target_fpr = 0.05

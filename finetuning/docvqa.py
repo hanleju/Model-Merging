@@ -63,7 +63,7 @@ def load_docvqa_data(docvqa_root: str, split: str = "val"):
     # Parse data structure
     dataset = []
     
-    # DocVQA JSON structure: {"data": [{"image": ..., "question": ..., "answers": [...], ...}, ...]}
+    # DocVQA JSON structure: {"data": [{"image": "documents/xxx.png", "question": ..., "answers": [...], ...}, ...]}
     if isinstance(qa_data, dict) and 'data' in qa_data:
         data_list = qa_data['data']
     elif isinstance(qa_data, list):
@@ -71,15 +71,24 @@ def load_docvqa_data(docvqa_root: str, split: str = "val"):
     else:
         raise ValueError(f"Unexpected JSON structure in {qa_file}")
     
-    for item in data_list:
-        # Get image filename
+    print(f"📊 Found {len(data_list)} items in JSON")
+    
+    skipped_no_image = 0
+    skipped_no_question = 0
+    
+    for idx, item in enumerate(data_list):
+        # Get image filename - the path is like "documents/pybv0228_81.png"
         if 'image' in item:
             image_name = item['image']
+            # Extract just the filename from "documents/xxx.png" format
+            if '/' in image_name:
+                image_name = image_name.split('/')[-1]  # Get "pybv0228_81.png"
         elif 'image_id' in item:
             image_name = item['image_id']
         elif 'ucsf_document_id' in item:
             image_name = item['ucsf_document_id'] + '.png'
         else:
+            skipped_no_image += 1
             continue
         
         # Ensure .png extension
@@ -90,15 +99,20 @@ def load_docvqa_data(docvqa_root: str, split: str = "val"):
         
         # Skip if image doesn't exist
         if not os.path.exists(image_path):
+            skipped_no_image += 1
             continue
         
         # Get question and answers
         question = item.get('question', '')
+        if not question:
+            skipped_no_question += 1
+            continue
+            
         answers = item.get('answers', [])
         
         # Handle different answer formats
         if isinstance(answers, list) and len(answers) > 0:
-            # Use first answer or most common
+            # Use first answer
             answer = answers[0] if isinstance(answers[0], str) else str(answers[0])
         elif isinstance(answers, dict):
             # Sometimes answers is {"text": [...], ...}
@@ -117,6 +131,11 @@ def load_docvqa_data(docvqa_root: str, split: str = "val"):
         })
     
     print(f"✅ Loaded {len(dataset)} QA pairs")
+    if skipped_no_image > 0:
+        print(f"⚠️  Skipped {skipped_no_image} items (missing images)")
+    if skipped_no_question > 0:
+        print(f"⚠️  Skipped {skipped_no_question} items (missing questions)")
+    
     return dataset
 
 

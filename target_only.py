@@ -15,7 +15,7 @@ from scipy.stats import norm
 from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
 from typing import Dict, List, Tuple
 import json
-
+import matplotlib.pyplot as plt
 
 # =========================================================
 # Prompt Template
@@ -240,6 +240,11 @@ def target_only_inference(
     p_array = np.array(p_list)
     label_array = np.array(label_list)
     
+    plt.hist(p_array[label_array==0], bins=50, alpha=0.5, label='Member')
+    plt.hist(p_array[label_array==1], bins=50, alpha=0.5, label='Non-member')
+    plt.legend()
+    plt.savefig('p_value_distribution.png')
+
     # Check for NaN values
     valid_mask = ~np.isnan(p_array)
     if valid_mask.sum() < len(p_array):

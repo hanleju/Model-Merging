@@ -7,6 +7,7 @@ import torch
 import os
 import argparse
 import json
+import numpy as np
 from transformers import (
     PaliGemmaForConditionalGeneration,
     PaliGemmaProcessor,
@@ -314,6 +315,33 @@ def train(
     train_ds = VQAv2Dataset(train_data, processor, split="train")
     eval_ds = VQAv2Dataset(eval_data, processor, split="validation")
     
+    # Compute metrics function for VQAv2
+    def compute_metrics(eval_pred):
+        """Compute accuracy for VQAv2."""
+        predictions, labels = eval_pred
+        
+        # Replace -100 with pad token id for decoding
+        labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+        
+        # Decode predictions and labels
+        decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
+        
+        # Compute exact match accuracy
+        correct = 0
+        for pred, label in zip(decoded_preds, decoded_labels):
+            pred = pred.strip().lower()
+            label = label.strip().lower()
+            if pred == label:
+                correct += 1
+        
+        accuracy = correct / len(decoded_preds) if len(decoded_preds) > 0 else 0.0
+        
+        return {
+            "accuracy": accuracy,
+            "num_samples": len(decoded_preds)
+        }
+    
     # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -349,6 +377,7 @@ def train(
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=collate_fn,
+        compute_metrics=compute_metrics,
     )
     
     # Train

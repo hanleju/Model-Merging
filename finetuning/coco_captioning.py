@@ -7,6 +7,7 @@ import torch
 import os
 import argparse
 import json
+import numpy as np
 from transformers import (
     PaliGemmaForConditionalGeneration,
     PaliGemmaProcessor,
@@ -18,6 +19,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from PIL import Image
 from typing import Dict, List
 import wandb
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 
 # =========================================================
@@ -247,6 +249,39 @@ def train(
     train_dataset = COCOCaptioningDataset(train_data, processor, split="train")
     eval_dataset = COCOCaptioningDataset(eval_data, processor, split="validation")
     
+    # Compute metrics function for COCO Captioning
+    def compute_metrics(eval_pred):
+        """Compute BLEU-4 score for captioning."""
+        predictions, labels = eval_pred
+        
+        # Replace -100 with pad token id for decoding
+        labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+        
+        # Decode predictions and labels
+        decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
+        
+        # Compute BLEU-4 score
+        smooth = SmoothingFunction().method1
+        bleu_scores = []
+        
+        for pred, label in zip(decoded_preds, decoded_labels):
+            pred_tokens = pred.strip().split()
+            label_tokens = label.strip().split()
+            
+            if len(pred_tokens) > 0 and len(label_tokens) > 0:
+                score = sentence_bleu([label_tokens], pred_tokens, 
+                                     weights=(0.25, 0.25, 0.25, 0.25),
+                                     smoothing_function=smooth)
+                bleu_scores.append(score)
+        
+        avg_bleu = np.mean(bleu_scores) if bleu_scores else 0.0
+        
+        return {
+            "bleu4": avg_bleu,
+            "num_samples": len(bleu_scores)
+        }
+    
     # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -283,6 +318,7 @@ def train(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=collate_fn,
+        compute_metrics=compute_metrics,
     )
     
     # Train

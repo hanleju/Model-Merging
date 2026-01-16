@@ -7,6 +7,7 @@ import torch
 import os
 import argparse
 import json
+import numpy as np
 from transformers import (
     PaliGemmaForConditionalGeneration,
     PaliGemmaProcessor,
@@ -18,6 +19,25 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from PIL import Image
 from typing import Dict, List
 import wandb
+try:
+    from Levenshtein import distance as levenshtein_distance
+except ImportError:
+    # Fallback implementation
+    def levenshtein_distance(s1, s2):
+        if len(s1) < len(s2):
+            return levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
 
 
 # =========================================================
@@ -281,6 +301,41 @@ def train(
     train_ds = DocVQADataset(train_data, processor, split="train")
     eval_ds = DocVQADataset(eval_data, processor, split="validation")
     
+    # Compute metrics function for DocVQA
+    def compute_metrics(eval_pred):
+        """Compute ANLS (Average Normalized Levenshtein Similarity) for DocVQA."""
+        predictions, labels = eval_pred
+        
+        # Replace -100 with pad token id for decoding
+        labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+        
+        # Decode predictions and labels
+        decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
+        
+        # Compute ANLS
+        anls_scores = []
+        
+        for pred, label in zip(decoded_preds, decoded_labels):
+            pred = pred.strip().lower()
+            label = label.strip().lower()
+            
+            if len(label) == 0:
+                score = 1.0 if len(pred) == 0 else 0.0
+            else:
+                edit_dist = levenshtein_distance(pred, label)
+                max_len = max(len(pred), len(label))
+                score = 1.0 - (edit_dist / max_len) if max_len > 0 else 0.0
+            
+            anls_scores.append(score)
+        
+        avg_anls = np.mean(anls_scores) if anls_scores else 0.0
+        
+        return {
+            "anls": avg_anls,
+            "num_samples": len(anls_scores)
+        }
+    
     # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -316,6 +371,7 @@ def train(
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=collate_fn,
+        compute_metrics=compute_metrics,
     )
     
     # Train

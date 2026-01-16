@@ -136,7 +136,90 @@ python merge_vlm.py \
 3. **긴 텍스트**: DocVQA는 max_length=256 사용 (문서 이해)
 4. **데이터셋 크기**: 전체 학습은 시간이 오래 걸림 (VQAv2 ~400k samples)
 
-## 🐛 Troubleshooting
+## � Evaluation Metrics
+
+각 태스크별로 사용하는 표준 평가 지표:
+
+### VQAv2 (일반 VQA)
+- **Metric**: VQA Accuracy
+- **계산법**: `min(답변 일치 수 / 3, 1.0)`
+- 10명의 annotator 중 최소 3명이 동일한 답변을 한 경우 정답
+
+```python
+# 간단한 구현 예시
+def vqa_accuracy(pred, gt_answers):
+    """gt_answers: list of 10 human annotations"""
+    count = sum(1 for ans in gt_answers if ans == pred)
+    return min(count / 3.0, 1.0)
+```
+
+### DocVQA (문서 VQA)
+- **Metric**: ANLS (Average Normalized Levenshtein Similarity)
+- **범위**: 0~1 (1이 완벽한 일치)
+- 문서에서는 정확한 매칭보다 유사도가 중요
+
+```python
+from Levenshtein import distance
+
+def anls(pred, gt):
+    """Average Normalized Levenshtein Similarity"""
+    if len(gt) == 0:
+        return 1.0 if len(pred) == 0 else 0.0
+    edit_dist = distance(pred.lower(), gt.lower())
+    max_len = max(len(pred), len(gt))
+    return 1.0 - (edit_dist / max_len)
+```
+
+### GQA (Visual Reasoning)
+- **Metric**: Accuracy + Consistency Score
+- **Accuracy**: 정확히 일치하는 답변의 비율
+- **Consistency**: Compositional reasoning 평가
+
+```python
+def gqa_accuracy(pred, gt):
+    """Simple exact match"""
+    return 1.0 if pred.lower().strip() == gt.lower().strip() else 0.0
+```
+
+### COCO Captioning
+- **주요 Metric**: CIDEr (Consensus-based Image Description Evaluation)
+- **보조 Metrics**: BLEU-4, METEOR, ROUGE-L, SPICE
+
+```python
+# pycocoevalcap 사용
+from pycocoevalcap.cider.cider import Cider
+
+cider = Cider()
+score, scores = cider.compute_score(gts, res)
+# gts: {image_id: [ref1, ref2, ...]}
+# res: {image_id: [pred]}
+```
+
+## 🧪 Evaluation 실행
+
+평가 스크립트는 별도로 제공됩니다:
+
+```bash
+# VQAv2 평가
+python eval.py \
+  --task vqav2 \
+  --model_path ./models/paligemma-vqav2 \
+  --data_root D:/VQA/cocoqa
+
+# COCO Captioning 평가
+python eval.py \
+  --task captioning \
+  --model_path ./models/paligemma-coco \
+  --data_root D:/coco2017
+```
+
+**필요 패키지**:
+```bash
+pip install python-Levenshtein
+pip install pycocoevalcap  # COCO captioning metrics
+```
+
+## �🐛 Troubleshooting
 
 ### CUDA Out of Memory
 ```bash

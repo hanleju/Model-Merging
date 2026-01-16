@@ -1,6 +1,6 @@
 """
-COCO Captioning Fine-tuning for PaliGemma
-Uses 4-bit quantization and gradient checkpointing for efficient training
+COCO Captioning Fine-tuning for Moondream2
+Image captioning with 4-bit quantization and gradient checkpointing
 """
 
 import torch
@@ -9,8 +9,8 @@ import argparse
 import json
 import numpy as np
 from transformers import (
-    PaliGemmaForConditionalGeneration,
-    PaliGemmaProcessor,
+    AutoModelForCausalLM,
+    AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
     Trainer
@@ -67,76 +67,173 @@ def load_coco_annotations(coco_root: str, split: str = "val"):
 
 
 class COCOCaptioningDataset(torch.utils.data.Dataset):
-    """COCO Captioning Dataset for PaliGemma."""
+    """COCO Captioning Dataset for Moondream2 with caching support."""
     
-    def __init__(self, data_list, processor, split="train"):
+    def __init__(self, data_list, model, tokenizer, split="train"):
         self.data = data_list
-        self.processor = processor
+        self.model = model
+        self.tokenizer = tokenizer
         self.split = split
+        self.cached_samples = []
+    
+    def _preprocess_and_cache(self, cache_file):
+        """Preprocess all samples and save to disk."""
+        from tqdm import tqdm
+        import gc  # 가비지 컬렉터 추가
+        
+        # 주기적인 정리를 위한 카운터
+        cleanup_step = 100
+        
+        for idx in tqdm(range(len(self.data)), desc="Preprocessing"):
+            item = self.data[idx]
+            
+            # Load and resize image (Moondream2 uses 378x378)
+            try:
+                image = Image.open(item['image_path']).convert('RGB')
+                image = image.resize((378, 378), Image.Resampling.LANCZOS)
+            except Exception as e:
+                print(f"⚠️  Error loading image {item['image_path']}: {e}")
+                image = Image.new('RGB', (378, 378), color='white')
+            
+            # Get caption (use first caption)
+            caption = item['captions'][0]
+            
+            # Moondream2 format for captioning
+            prompt = "\n\nDescribe this image in detail.\n\nAnswer:"
+            full_text = prompt + caption
+            
+            # Encode image using Moondream2's encode_image
+            with torch.no_grad():
+                image_embeds = self.model.encode_image(image)
+            
+            # Tokenize text
+            tokens = self.tokenizer(
+                full_text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=512
+            )
+            
+            # Remove batch dimension
+            input_ids = tokens['input_ids'].squeeze(0)
+            attention_mask = tokens['attention_mask'].squeeze(0)
+            
+            # Create labels
+            labels = input_ids.clone()
+            
+            # Tokenize just prompt to find its length
+            prompt_tokens = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                add_special_tokens=False
+            )
+            prompt_len = prompt_tokens['input_ids'].shape[1]
+            
+            # Mask prompt in labels
+            labels[:prompt_len] = -100
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            
+            # Store processed sample
+            sample = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                # [수정 1] GPU 텐서를 CPU로 이동시켜야 함!
+                'image_embeds': image_embeds.squeeze(0).cpu(),
+                'labels': labels
+            }
+            self.cached_samples.append(sample)
+            
+            # [수정 2] 반복문 내에서 GPU 메모리 명시적 해제 (선택사항이지만 권장)
+            del image_embeds
+            if idx % cleanup_step == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        # Save to disk
+        torch.save(self.cached_samples, cache_file)
+        
+        # [수정 3] 캐싱 완료 후 모델이 생성한 임시 찌꺼기 최종 정리
+        gc.collect()
+        torch.cuda.empty_cache()
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
+        # If we have cached samples, return them directly (very fast!)
+        if self.cached_samples:
+            return self.cached_samples[idx]
+        
+        # Otherwise, process on-the-fly (slower)
         item = self.data[idx]
         
-        # Load image
+        # Load image and resize to 378x378 (Moondream2 default)
         try:
             image = Image.open(item['image_path']).convert('RGB')
+            image = image.resize((378, 378), Image.Resampling.LANCZOS)
         except Exception as e:
             print(f"⚠️  Error loading image {item['image_path']}: {e}")
-            # Return a dummy sample
-            image = Image.new('RGB', (448, 448), color='white')
+            image = Image.new('RGB', (378, 378), color='white')
         
-        # Get caption (use first caption)
+        # Get caption
         caption = item['captions'][0]
         
-        # Format prompt for captioning
-        prompt = "<image>Describe this image in detail."
+        # Moondream2 format
+        prompt = "\n\nDescribe this image in detail.\n\nAnswer:"
+        full_text = prompt + caption
         
-        # Process inputs
-        inputs = self.processor(
-            text=prompt,
-            images=image,
+        # Encode image
+        with torch.no_grad():
+            image_embeds = self.model.encode_image(image)
+        
+        # Tokenize text
+        tokens = self.tokenizer(
+            full_text,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=128
+            max_length=512
         )
         
-        # Process labels (caption)
-        labels = self.processor.tokenizer(
-            caption,
+        input_ids = tokens['input_ids'].squeeze(0)
+        attention_mask = tokens['attention_mask'].squeeze(0)
+        
+        # Create labels
+        labels = input_ids.clone()
+        
+        # Tokenize prompt to find its length
+        prompt_tokens = self.tokenizer(
+            prompt,
             return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=128
-        ).input_ids
+            add_special_tokens=False
+        )
+        prompt_len = prompt_tokens['input_ids'].shape[1]
         
-        # Remove batch dimension
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-        labels = labels.squeeze(0)
+        # Mask prompt in labels
+        labels[:prompt_len] = -100
+        labels[labels == self.tokenizer.pad_token_id] = -100
         
-        # Replace padding token id with -100 for loss computation
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        
-        inputs['labels'] = labels
-        
-        return inputs
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            # CPU로 이동하여 GPU 메모리 누수 방지
+            'image_embeds': image_embeds.squeeze(0).cpu(),
+            'labels': labels
+        }
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
-    """Collate function for DataLoader."""
-    # Stack all tensors
+    """Collate function for DataLoader (Moondream2)."""
     input_ids = torch.stack([item['input_ids'] for item in batch])
-    pixel_values = torch.stack([item['pixel_values'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    image_embeds = torch.stack([item['image_embeds'] for item in batch])
     labels = torch.stack([item['labels'] for item in batch])
     
     return {
         'input_ids': input_ids,
-        'pixel_values': pixel_values,
         'attention_mask': attention_mask,
+        'image_embeds': image_embeds,
         'labels': labels
     }
 
@@ -145,16 +242,16 @@ def collate_fn(batch: List[Dict]) -> Dict:
 # Model Setup
 # =========================================================
 
-def setup_model_and_processor(
+def setup_model_and_tokenizer(
     model_path: str,
     device: str = "cuda",
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32
 ):
-    """Setup PaliGemma model with 4-bit quantization and LoRA."""
+    """Setup Moondream2 model with 4-bit quantization and LoRA."""
     
-    print(f"📥 Loading model: {model_path}")
+    print(f"📥 Loading Moondream2: {model_path}")
     
     # 4-bit quantization config
     bnb_config = BitsAndBytesConfig(
@@ -164,12 +261,21 @@ def setup_model_and_processor(
         bnb_4bit_use_double_quant=True,
     )
     
-    # Load model with quantization
-    model = PaliGemmaForConditionalGeneration.from_pretrained(
+    # Load Moondream2 model
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=bnb_config,
-        device_map={"": 0},  # Load on first GPU
+        device_map={"": 0},
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        revision="2024-08-26"
+    )
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        revision="2024-08-26"
     )
     
     # Enable gradient checkpointing
@@ -177,11 +283,11 @@ def setup_model_and_processor(
     model = prepare_model_for_kbit_training(model)
     
     if use_lora:
-        # LoRA configuration
+        # LoRA configuration for Moondream2 (Phi-based)
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=["Wqkv", "out_proj"],
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM"
@@ -190,11 +296,32 @@ def setup_model_and_processor(
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
     
-    # Load processor
-    processor = PaliGemmaProcessor.from_pretrained(model_path)
-    
     print("✅ Model setup complete!\n")
-    return model, processor
+    return model, tokenizer
+
+
+# =========================================================
+# Custom Trainer
+# =========================================================
+
+class Moondream2Trainer(Trainer):
+    """Custom Trainer for Moondream2 that handles image embeddings."""
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Custom loss computation that passes image_embeds to model."""
+        image_embeds = inputs.pop('image_embeds')
+        labels = inputs.pop('labels')
+        
+        # Forward pass with image embeddings
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            labels=labels,
+            image_embeds=image_embeds
+        )
+        
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
 
 # =========================================================
@@ -212,16 +339,16 @@ def train(
     max_train_samples: int = None,
     max_eval_samples: int = None,
     use_wandb: bool = False,
-    wandb_project: str = "paligemma-coco",
+    wandb_project: str = "moondream-coco",
     device: str = "cuda"
 ):
-    """Fine-tune PaliGemma on COCO Captioning."""
+    """Fine-tune Moondream2 on COCO Captioning."""
     
-    print("🎯 COCO Captioning Fine-tuning")
+    print("🎯 COCO Captioning Fine-tuning (Moondream2)")
     print("="*60)
     
     # Setup model
-    model, processor = setup_model_and_processor(model_path, device)
+    model, tokenizer = setup_model_and_tokenizer(model_path, device)
     
     # Load COCO dataset from local files
     print(f"📂 Loading COCO dataset from: {coco_root}")
@@ -245,9 +372,9 @@ def train(
     print(f"   Train samples: {len(train_data)}")
     print(f"   Eval samples: {len(eval_data)}\n")
     
-    # Create datasets
-    train_dataset = COCOCaptioningDataset(train_data, processor, split="train")
-    eval_dataset = COCOCaptioningDataset(eval_data, processor, split="validation")
+    # Create datasets with caching support
+    train_dataset = COCOCaptioningDataset(train_data, model, tokenizer, split="train")
+    eval_dataset = COCOCaptioningDataset(eval_data, model, tokenizer, split="validation")
     
     # Compute metrics function for COCO Captioning
     def compute_metrics(eval_pred):
@@ -255,11 +382,11 @@ def train(
         predictions, labels = eval_pred
         
         # Replace -100 with pad token id for decoding
-        labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         
         # Decode predictions and labels
-        decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
-        decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
         
         # Compute BLEU-4 score
         smooth = SmoothingFunction().method1
@@ -300,19 +427,19 @@ def train(
         fp16=False,
         bf16=True,
         optim="paged_adamw_8bit",
-        gradient_checkpointing=True,
-        dataloader_num_workers=4,
-        remove_unused_columns=False,
         report_to="wandb" if use_wandb else "none",
-        run_name=f"paligemma-coco-{num_epochs}ep" if use_wandb else None,
+        load_best_model_at_end=True,
+        metric_for_best_model="bleu4",
+        greater_is_better=True,
+        remove_unused_columns=False,
     )
     
     # Initialize wandb if requested
     if use_wandb:
-        wandb.init(project=wandb_project, name=f"coco-captioning-{num_epochs}ep")
+        wandb.init(project=wandb_project, name=f"coco-moondream2-{num_epochs}ep")
     
     # Create trainer
-    trainer = Trainer(
+    trainer = Moondream2Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -328,7 +455,7 @@ def train(
     # Save final model
     print(f"\n💾 Saving model to {output_dir}")
     trainer.save_model(output_dir)
-    processor.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     
     print("\n✅ Training complete!")
 
@@ -338,13 +465,13 @@ def train(
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune PaliGemma on COCO Captioning")
+    parser = argparse.ArgumentParser(description="Fine-tune Moondream2 on COCO Captioning")
     
-    parser.add_argument("--model_path", type=str, default="google/paligemma-3b-pt-448",
-                       help="Base model path")
+    parser.add_argument("--model_path", type=str, default="vikhyatk/moondream2",
+                       help="Path to Moondream2 model")
     parser.add_argument("--coco_root", type=str, required=True,
-                       help="COCO dataset root directory (e.g., D:/coco2017/)")
-    parser.add_argument("--output_dir", type=str, required=True,
+                       help="COCO dataset root directory")
+    parser.add_argument("--output_dir", type=str, default="./outputs/coco_moondream2",
                        help="Output directory")
     parser.add_argument("--num_epochs", type=int, default=3,
                        help="Number of training epochs")
@@ -360,7 +487,7 @@ def main():
                        help="Max evaluation samples")
     parser.add_argument("--use_wandb", action="store_true",
                        help="Use Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="paligemma-coco",
+    parser.add_argument("--wandb_project", type=str, default="moondream-coco",
                        help="W&B project name")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")

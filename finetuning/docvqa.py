@@ -1,5 +1,5 @@
 """
-DocVQA Fine-tuning for PaliGemma
+DocVQA Fine-tuning for Moondream2
 Document Visual Question Answering with 4-bit quantization and gradient checkpointing
 """
 
@@ -9,8 +9,8 @@ import argparse
 import json
 import numpy as np
 from transformers import (
-    PaliGemmaForConditionalGeneration,
-    PaliGemmaProcessor,
+    AutoModelForCausalLM,
+    AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
     Trainer
@@ -140,76 +140,175 @@ def load_docvqa_data(docvqa_root: str, split: str = "val"):
 
 
 class DocVQADataset(torch.utils.data.Dataset):
-    """DocVQA Dataset for PaliGemma."""
+    """DocVQA Dataset for Moondream2 with caching support."""
     
-    def __init__(self, data_list, processor, split="train"):
+    def __init__(self, data_list, model, tokenizer, split="train"):
         self.data = data_list
-        self.processor = processor
+        self.model = model
+        self.tokenizer = tokenizer
         self.split = split
+        self.cached_samples = []
+    
+    def _preprocess_and_cache(self, cache_file):
+        """Preprocess all samples and save to disk."""
+        from tqdm import tqdm
+        import gc  # 가비지 컬렉터 추가
+        
+        # 주기적인 정리를 위한 카운터
+        cleanup_step = 100
+        
+        for idx in tqdm(range(len(self.data)), desc="Preprocessing"):
+            item = self.data[idx]
+            
+            # Load and resize image (Moondream2 uses 378x378)
+            try:
+                image = Image.open(item['image_path']).convert('RGB')
+                image = image.resize((378, 378), Image.Resampling.LANCZOS)
+            except Exception as e:
+                print(f"⚠️  Error loading image {item['image_path']}: {e}")
+                image = Image.new('RGB', (378, 378), color='white')
+            
+            # Get question and answer
+            question = item['question']
+            answer = item['answer']
+            
+            # Moondream2 format: "\n\nQuestion: {question}\n\nAnswer:"
+            prompt = f"\n\nQuestion: {question}\n\nAnswer:"
+            full_text = prompt + answer
+            
+            # Encode image using Moondream2's encode_image
+            with torch.no_grad():
+                image_embeds = self.model.encode_image(image)
+            
+            # Tokenize text
+            tokens = self.tokenizer(
+                full_text,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=512
+            )
+            
+            # Remove batch dimension
+            input_ids = tokens['input_ids'].squeeze(0)
+            attention_mask = tokens['attention_mask'].squeeze(0)
+            
+            # Create labels
+            labels = input_ids.clone()
+            
+            # Tokenize just prompt to find its length
+            prompt_tokens = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                add_special_tokens=False
+            )
+            prompt_len = prompt_tokens['input_ids'].shape[1]
+            
+            # Mask prompt in labels
+            labels[:prompt_len] = -100
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            
+            # Store processed sample
+            sample = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                # [수정 1] GPU 텐서를 CPU로 이동시켜야 함!
+                'image_embeds': image_embeds.squeeze(0).cpu(),
+                'labels': labels
+            }
+            self.cached_samples.append(sample)
+            
+            # [수정 2] 반복문 내에서 GPU 메모리 명시적 해제 (선택사항이지만 권장)
+            del image_embeds
+            if idx % cleanup_step == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        # Save to disk
+        torch.save(self.cached_samples, cache_file)
+        
+        # [수정 3] 캐싱 완료 후 모델이 생성한 임시 찌꺼기 최종 정리
+        gc.collect()
+        torch.cuda.empty_cache()
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
+        # If we have cached samples, return them directly (very fast!)
+        if self.cached_samples:
+            return self.cached_samples[idx]
+        
+        # Otherwise, process on-the-fly (slower)
         item = self.data[idx]
         
-        # Load image
+        # Load image and resize to 378x378 (Moondream2 default)
         try:
             image = Image.open(item['image_path']).convert('RGB')
+            image = image.resize((378, 378), Image.Resampling.LANCZOS)
         except Exception as e:
             print(f"⚠️  Error loading image {item['image_path']}: {e}")
-            # Return a dummy sample
-            image = Image.new('RGB', (448, 448), color='white')
+            image = Image.new('RGB', (378, 378), color='white')
         
         # Get question and answer
         question = item['question']
         answer = item['answer']
         
-        # Format prompt for document VQA
-        prompt = f"<image>Question: {question}\nAnswer:"
+        # Moondream2 format
+        prompt = f"\n\nQuestion: {question}\n\nAnswer:"
+        full_text = prompt + answer
         
-        # Process inputs
-        inputs = self.processor(
-            text=prompt,
-            images=image,
+        # Encode image
+        with torch.no_grad():
+            image_embeds = self.model.encode_image(image)
+        
+        # Tokenize text
+        tokens = self.tokenizer(
+            full_text,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
-            max_length=256  # Longer for document understanding
+            max_length=512
         )
         
-        # Process labels (answer)
-        labels = self.processor.tokenizer(
-            answer,
+        input_ids = tokens['input_ids'].squeeze(0)
+        attention_mask = tokens['attention_mask'].squeeze(0)
+        
+        # Create labels
+        labels = input_ids.clone()
+        
+        # Tokenize prompt to find its length
+        prompt_tokens = self.tokenizer(
+            prompt,
             return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=64
-        ).input_ids
+            add_special_tokens=False
+        )
+        prompt_len = prompt_tokens['input_ids'].shape[1]
         
-        # Remove batch dimension
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-        labels = labels.squeeze(0)
+        # Mask prompt in labels
+        labels[:prompt_len] = -100
+        labels[labels == self.tokenizer.pad_token_id] = -100
         
-        # Replace padding token id with -100
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
-        
-        inputs['labels'] = labels
-        
-        return inputs
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            # CPU로 이동하여 GPU 메모리 누수 방지
+            'image_embeds': image_embeds.squeeze(0).cpu(),
+            'labels': labels
+        }
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
-    """Collate function for DataLoader."""
+    """Collate function for DataLoader (Moondream2)."""
     input_ids = torch.stack([item['input_ids'] for item in batch])
-    pixel_values = torch.stack([item['pixel_values'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    image_embeds = torch.stack([item['image_embeds'] for item in batch])
     labels = torch.stack([item['labels'] for item in batch])
     
     return {
         'input_ids': input_ids,
-        'pixel_values': pixel_values,
         'attention_mask': attention_mask,
+        'image_embeds': image_embeds,
         'labels': labels
     }
 
@@ -218,16 +317,16 @@ def collate_fn(batch: List[Dict]) -> Dict:
 # Model Setup
 # =========================================================
 
-def setup_model_and_processor(
+def setup_model_and_tokenizer(
     model_path: str,
     device: str = "cuda",
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32
 ):
-    """Setup PaliGemma model with 4-bit quantization and LoRA."""
+    """Setup Moondream2 model with 4-bit quantization and LoRA."""
     
-    print(f"📥 Loading model: {model_path}")
+    print(f"📥 Loading Moondream2: {model_path}")
     
     # 4-bit quantization config
     bnb_config = BitsAndBytesConfig(
@@ -237,23 +336,38 @@ def setup_model_and_processor(
         bnb_4bit_use_double_quant=True,
     )
     
-    # Load model with quantization
-    model = PaliGemmaForConditionalGeneration.from_pretrained(
+    # Load Moondream2 model
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
         quantization_config=bnb_config,
         device_map={"": 0},
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        revision="2024-08-26"
     )
     
-    # Enable gradient checkpointing
-    model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        revision="2024-08-26"
+    )
+    
+    # Set pad_token if not present (Moondream2 doesn't have one by default)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    # Prepare model for training (Moondream2 doesn't support gradient checkpointing)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     
     if use_lora:
+        # Moondream2 (Phi-based) LoRA configuration
+        # Phi models use different module names: Wqkv (combined q,k,v) and out_proj
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=["Wqkv", "out_proj"],  # Phi model specific modules
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM"
@@ -262,10 +376,8 @@ def setup_model_and_processor(
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
     
-    processor = PaliGemmaProcessor.from_pretrained(model_path)
-    
     print("✅ Model setup complete!\n")
-    return model, processor
+    return model, tokenizer
 
 
 # =========================================================
@@ -283,16 +395,16 @@ def train(
     max_train_samples: int = None,
     max_eval_samples: int = None,
     use_wandb: bool = False,
-    wandb_project: str = "paligemma-docvqa",
-    device: str = "cuda"
+    wandb_project: str = "moondream2-docvqa",
+    device: str = "cuda",
 ):
-    """Fine-tune PaliGemma on DocVQA."""
+    """Fine-tune Moondream2 on DocVQA."""
     
-    print("🎯 DocVQA Fine-tuning")
+    print("🎯 DocVQA Fine-tuning (Moondream2)")
     print("="*60)
     
     # Setup model
-    model, processor = setup_model_and_processor(model_path, device)
+    model, tokenizer = setup_model_and_tokenizer(model_path, device)
     
     # Load DocVQA dataset from local files
     print(f"📂 Loading DocVQA dataset from: {docvqa_root}")
@@ -316,9 +428,9 @@ def train(
     print(f"   Train samples: {len(train_data)}")
     print(f"   Eval samples: {len(eval_data)}\n")
     
-    # Create datasets
-    train_ds = DocVQADataset(train_data, processor, split="train")
-    eval_ds = DocVQADataset(eval_data, processor, split="validation")
+    # Create datasets with caching
+    train_ds = DocVQADataset(train_data, model, tokenizer, split="train")
+    eval_ds = DocVQADataset(eval_data, model, tokenizer, split="validation")
     
     # Compute metrics function for DocVQA
     def compute_metrics(eval_pred):
@@ -326,11 +438,11 @@ def train(
         predictions, labels = eval_pred
         
         # Replace -100 with pad token id for decoding
-        labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         
         # Decode predictions and labels
-        decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
-        decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
         
         # Compute ANLS
         anls_scores = []
@@ -355,29 +467,31 @@ def train(
             "num_samples": len(anls_scores)
         }
     
-    # Training arguments
+    # Training arguments - optimized for speed
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=4,  # Moondream2는 더 작아서 배치 크기 늘릴 수 있음
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=max(1, batch_size // 4),
         learning_rate=learning_rate,
         warmup_steps=100,
-        logging_steps=50,
+        logging_steps=10,
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=1000,
         save_strategy="steps",
-        save_steps=500,
+        save_steps=1000,
         save_total_limit=2,
         fp16=False,
         bf16=True,
         optim="paged_adamw_8bit",
-        gradient_checkpointing=True,
         dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=2,
+        max_grad_norm=1.0,
         remove_unused_columns=False,
         report_to="wandb" if use_wandb else "none",
-        run_name=f"paligemma-docvqa-{num_epochs}ep" if use_wandb else None,
+        run_name=f"moondream2-docvqa-{num_epochs}ep" if use_wandb else None,
     )
     
     if use_wandb:
@@ -400,7 +514,7 @@ def train(
     # Save final model
     print(f"\n💾 Saving model to {output_dir}")
     trainer.save_model(output_dir)
-    processor.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     
     print("\n✅ Training complete!")
 
@@ -410,10 +524,10 @@ def train(
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune PaliGemma on DocVQA")
+    parser = argparse.ArgumentParser(description="Fine-tune Moondream2 on DocVQA")
     
-    parser.add_argument("--model_path", type=str, default="google/paligemma-3b-pt-448",
-                       help="Base model path")
+    parser.add_argument("--model_path", type=str, default="vikhyatk/moondream2",
+                       help="Base model path (default: vikhyatk/moondream2)")
     parser.add_argument("--docvqa_root", type=str, required=True,
                        help="DocVQA dataset root directory (e.g., D:/VQA/docvqa/)")
     parser.add_argument("--output_dir", type=str, required=True,
@@ -421,7 +535,7 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=5,
                        help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=4,
-                       help="Batch size per device")
+                       help="Effective batch size (will use gradient accumulation)")
     parser.add_argument("--learning_rate", type=float, default=2e-4,
                        help="Learning rate")
     parser.add_argument("--train_split_ratio", type=float, default=0.8,
@@ -432,7 +546,7 @@ def main():
                        help="Max evaluation samples")
     parser.add_argument("--use_wandb", action="store_true",
                        help="Use Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="paligemma-docvqa",
+    parser.add_argument("--wandb_project", type=str, default="moondream2-docvqa",
                        help="W&B project name")
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device to use")

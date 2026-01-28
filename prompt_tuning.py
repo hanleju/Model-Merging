@@ -36,14 +36,14 @@ OUTPUT_DIR = "./attack_results/beast_attack/"
 
 # Attack parameters
 INITIAL_PROMPT = "Describe this image."
-NUM_ITERATIONS = 30  # Reduced for faster experiments
-NUM_CANDIDATES = 20  # Number of token candidates to try per position
-BATCH_SIZE = 8  # Number of images to evaluate per iteration
+NUM_ITERATIONS = 50  # Reduced for faster experiments
+NUM_CANDIDATES = 30  # Number of token candidates to try per position
+BATCH_SIZE = 16  # Number of images to evaluate per iteration
 BEAM_WIDTH = 5  # Number of best prompts to keep (BEAST algorithm)
 
 # Entropy calculation mode
 USE_FORWARD_ONLY = False  # True: forward() only (10x faster), False: generate()
-NUM_ENTROPY_TOKENS = 4  # Number of tokens to consider for entropy (1-3 recommended)
+NUM_ENTROPY_TOKENS = 5  # Number of tokens to consider for entropy (1-3 recommended)
 
 MAX_NEW_TOKENS = 10  # For caption generation (only used if USE_FORWARD_ONLY=False)
 

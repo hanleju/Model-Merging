@@ -1,77 +1,129 @@
+
 """
-Target-Only Membership Inference Attack for Vision-Language Models
-Uses FairFace (member) and UTKFace (non-member) datasets
+Target-Only Membership Inference Attack for Vision-Language Models (COCO Caption)
+Perplexity-based MIA, COCO train2017=member, val2017=non-member
 """
 
-import torch
+
 import os
-import argparse
+import json
+import torch
+import random
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 from PIL import Image
 from tqdm import tqdm
-from transformers import PaliGemmaForConditionalGeneration, PaliGemmaProcessor
-from scipy.stats import norm
-from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
 from typing import Dict, List, Tuple
-import json
+from collections import defaultdict
 import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score
+from transformers import (
+    AutoProcessor,
+    PaliGemmaForConditionalGeneration,
+    BitsAndBytesConfig
+)
 
-# =========================================================
-# Prompt Template
-# =========================================================
-
-PROMPT_TEMPLATES = {
-    'age': '<image>What is the age group of the person?',
-    'gender': '<image>What is the gender of the person?',
-    'race': '<image>What is the race of the person?'
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+MODEL_CONFIG = {
+    "model_id": "google/paligemma-3b-ft-cococap-224",
+    "merged_model_path": "./models/merge_weights/pali_vqa_caption",  # merge_vlm.py output dir
+    "is_lora_adapter": False
 }
+MODEL_ID = MODEL_CONFIG["model_id"]
+DATA_ROOT = "D:/datasets/coco/"
+TRAIN_IMAGES_DIR = os.path.join(DATA_ROOT, "train2017")
+VAL_IMAGES_DIR = os.path.join(DATA_ROOT, "val2017")
+TRAIN_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_train2017.json")
+VAL_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_val2017.json")
+OUTPUT_DIR = "./attack_results/eval/0128/pali_merge_target_only"
+NUM_EVAL_SAMPLES = 500
+PROMPT = "Describe this image."
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
 
 
-# =========================================================
-# Model Functions
-# =========================================================
 
-def load_model_and_processor(model_path: str, device: str = "cuda"):
-    """Load PaliGemma model and processor."""
-    print(f"📥 Loading model from: {model_path}")
-    
-    model = PaliGemmaForConditionalGeneration.from_pretrained(
-        model_path,
-        dtype=torch.bfloat16,
-        device_map=device
+# -----------------------------------------------------------------------------
+# Data Loading (COCO)
+# -----------------------------------------------------------------------------
+def load_coco_data(annotation_file, images_dir, num_samples=None, seed=42):
+    """Load COCO caption data with ground truth captions."""
+    print(f"[Info] Loading data from {annotation_file}...")
+    if not os.path.exists(annotation_file):
+        print(f"[Error] Annotation file not found: {annotation_file}")
+        return []
+    with open(annotation_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    img_id_to_filename = {img['id']: img['file_name'] for img in data['images']}
+    image_to_captions = defaultdict(list)
+    for ann in data['annotations']:
+        img_id = ann['image_id']
+        caption = ann['caption']
+        image_to_captions[img_id].append(caption)
+    formatted_data = []
+    for img_id, captions in image_to_captions.items():
+        if img_id in img_id_to_filename:
+            file_name = img_id_to_filename[img_id]
+            full_path = os.path.join(images_dir, file_name)
+            if os.path.exists(full_path):
+                formatted_data.append({
+                    "image_id": img_id,
+                    "image_path": full_path,
+                    "captions": captions
+                })
+    print(f"[Info] Loaded {len(formatted_data)} images with captions")
+    if num_samples:
+        random.seed(seed)
+        random.shuffle(formatted_data)
+        formatted_data = formatted_data[:num_samples]
+        print(f"[Info] Sampled {len(formatted_data)} images for evaluation")
+    return formatted_data
+
+# -----------------------------------------------------------------------------
+# Model Loading
+# -----------------------------------------------------------------------------
+def load_model_and_processor():
+    config = MODEL_CONFIG
+    model_id = config["model_id"]
+    merged_model_path = config.get("merged_model_path", None)
+    is_lora_adapter = config.get("is_lora_adapter", False)
+    print(f"[Info] Loading model: {model_id}")
+    # Processor: merged_model_path 우선, 없으면 model_id
+    processor = AutoProcessor.from_pretrained(
+        merged_model_path if merged_model_path and os.path.exists(merged_model_path) else model_id
     )
+    # Quantization config
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0
+    )
+    # Merged model 우선, 없으면 base model
+    if merged_model_path and os.path.exists(merged_model_path):
+        adapter_config_path = os.path.join(merged_model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            print(f"[Warning] Removing adapter_config.json from merged model directory: {adapter_config_path}")
+            os.remove(adapter_config_path)
+        print(f"[Info] Loading merged model from: {merged_model_path}")
+        model = PaliGemmaForConditionalGeneration.from_pretrained(
+            merged_model_path,
+            quantization_config=quantization_config,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+    else:
+        print(f"[Info] Loading base model: {model_id}")
+        model = PaliGemmaForConditionalGeneration.from_pretrained(
+            model_id,
+            quantization_config=quantization_config,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
     model.eval()
-    
-    try:
-        processor = PaliGemmaProcessor.from_pretrained(model_path)
-    except (OSError, ValueError):
-        print("⚠️  Processor not found, using base PaliGemma processor...")
-        processor = PaliGemmaProcessor.from_pretrained("google/paligemma-3b-pt-224")
-    
-    print("✅ Model loaded successfully!\n")
+    print(f"[Info] Model loaded successfully")
     return model, processor
-
-
-# =========================================================
-# Data Loading Functions
-# =========================================================
-
-def load_dataset(data_dir: str, split: str = "val", max_samples: int = None) -> pd.DataFrame:
-    """Load dataset from FairFace format."""
-    csv_path = os.path.join(data_dir, "labels", f"{split}.csv")
-    
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    
-    df = pd.read_csv(csv_path)
-    df['image_path'] = df['file'].apply(lambda x: os.path.join(data_dir, "images", x))
-    df = df[df['image_path'].apply(os.path.exists)]
-    
-    if max_samples:
-        df = df.sample(n=min(max_samples, len(df)), random_state=42).reset_index(drop=True)
-    
-    return df
 
 
 # =========================================================
@@ -93,9 +145,15 @@ def compute_similarity_with_temperature(
     Returns:
         Dictionary with various similarity metrics
     """
-    prompt = PROMPT_TEMPLATES[attribute]
+    prompt = PROMPT
     
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+   # Prepare inputs with ground truth caption
+    prompt_with_image = f"<image>{PROMPT}"
+    inputs = processor(
+        text=prompt_with_image,
+        images=image,
+        return_tensors="pt"
+    ).to(device)
     
     with torch.no_grad():
         # Generate with temperature
@@ -135,7 +193,6 @@ def compute_similarity_with_temperature(
         'recall': recall,
         'f1': f1
     }
-
 
 def compute_dataset_similarities(
     model,
@@ -200,7 +257,6 @@ def perform_z_test(group1: List[float], group2: List[float]) -> float:
     
     return p_value
 
-
 def target_only_inference(
     member_data: List[Dict],
     non_member_data: List[Dict],
@@ -209,7 +265,7 @@ def target_only_inference(
     temperature_high: float,
     metric: str,
     num_tests: int = 1000
-) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float]:
     """
     Perform target-only membership inference attack.
     
@@ -243,7 +299,9 @@ def target_only_inference(
     plt.hist(p_array[label_array==0], bins=50, alpha=0.5, label='Member')
     plt.hist(p_array[label_array==1], bins=50, alpha=0.5, label='Non-member')
     plt.legend()
-    plt.savefig('p_value_distribution.png')
+    plot_file = os.path.join(OUTPUT_DIR, 'p_value_distribution.png')
+    plt.savefig(plot_file)
+    plt.close()
 
     # Check for NaN values
     valid_mask = ~np.isnan(p_array)
@@ -276,187 +334,81 @@ def target_only_inference(
     
     return auc, attack_acc, tpr_at_5fpr
 
-
-# =========================================================
-# Main Function
-# =========================================================
-
+# -----------------------------------------------------------------------------
+# Main Execution
+# -----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Target-Only Membership Inference Attack using FairFace and UTKFace"
+    print("=" * 80)
+    print("Target-Only Membership Inference Attack (COCO Caption)")
+    print("=" * 80)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    print(f"\n[Model] {MODEL_ID}")
+    model, processor = load_model_and_processor()
+    print("\n[Step 1] Loading member data (train2017)...")
+    member_data = load_coco_data(
+        TRAIN_ANNOTATION_FILE,
+        TRAIN_IMAGES_DIR,
+        num_samples=NUM_EVAL_SAMPLES,
+        seed=SEED
     )
-    
-    # Model arguments
-    parser.add_argument("--model_path", type=str, required=True,
-                       help="Path to model or HuggingFace model ID")
-    
-    # Data arguments
-    parser.add_argument("--member_data_dir", type=str, required=True,
-                       help="FairFace directory (member data)")
-    parser.add_argument("--non_member_data_dir", type=str, required=True,
-                       help="UTKFace directory (non-member data)")
-    parser.add_argument("--member_split", type=str, default="train",
-                       help="FairFace split for members (default: train)")
-    parser.add_argument("--non_member_split", type=str, default="val",
-                       help="UTKFace split for non-members (default: val)")
-    parser.add_argument("--member_samples", type=int, default=1000,
-                       help="Number of member samples (default: 1000)")
-    parser.add_argument("--non_member_samples", type=int, default=1000,
-                       help="Number of non-member samples (default: 1000)")
-    
-    # Attack parameters
-    parser.add_argument("--attribute", type=str, default="age",
-                       choices=["age", "gender", "race"],
-                       help="Attribute to evaluate (default: age)")
-    parser.add_argument("--temperature_low", type=float, default=0.1,
-                       help="Low temperature (default: 0.1)")
-    parser.add_argument("--temperature_high", type=float, default=1.6,
-                       help="High temperature (default: 1.6)")
-    parser.add_argument("--granularity", type=int, default=50,
-                       help="Samples per test (default: 50)")
-    parser.add_argument("--metric", type=str, default="f1",
-                       choices=["exact_match", "contains", "precision", "recall", "f1"],
-                       help="Similarity metric (default: f1)")
-    parser.add_argument("--num_runs", type=int, default=5,
-                       help="Number of attack runs (default: 5)")
-    parser.add_argument("--num_tests", type=int, default=1000,
-                       help="Number of tests per run (default: 1000)")
-    
-    # Output
-    parser.add_argument("--output", type=str, default="output",
-                       help="Output directory (default: output)")
-    parser.add_argument("--device", type=str, default="cuda",
-                       help="Device (default: cuda)")
-    
-    args = parser.parse_args()
-    
-    # Check device
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("⚠️  CUDA not available, using CPU")
-        args.device = "cpu"
-    
-    print("🎯 Target-Only Membership Inference Attack")
-    print("="*60)
-    print(f"Model           : {args.model_path}")
-    print(f"Member data     : {args.member_data_dir}")
-    print(f"Non-member data : {args.non_member_data_dir}")
-    print(f"Attribute       : {args.attribute}")
-    print(f"Temperature     : [{args.temperature_low}, {args.temperature_high}]")
-    print(f"Granularity     : {args.granularity}")
-    print(f"Metric          : {args.metric}")
-    print("="*60 + "\n")
-    
-    # Load model
-    model, processor = load_model_and_processor(args.model_path, args.device)
-    
-    # Load datasets
-    print(f"📂 Loading member data (FairFace)...")
-    member_df = load_dataset(args.member_data_dir, args.member_split, args.member_samples)
-    print(f"   Loaded {len(member_df)} member samples\n")
-    
-    print(f"📂 Loading non-member data (UTKFace)...")
-    non_member_df = load_dataset(args.non_member_data_dir, args.non_member_split, args.non_member_samples)
-    print(f"   Loaded {len(non_member_df)} non-member samples\n")
-    
-    # Compute similarities
-    temperatures = [args.temperature_low, args.temperature_high]
-    
-    member_similarities = compute_dataset_similarities(
-        model, processor, member_df, args.attribute, temperatures, args.device, "Members"
+    print("\n[Step 2] Loading non-member data (val2017)...")
+    nonmember_data = load_coco_data(
+        VAL_ANNOTATION_FILE,
+        VAL_IMAGES_DIR,
+        num_samples=NUM_EVAL_SAMPLES,
+        seed=SEED
     )
-    
-    non_member_similarities = compute_dataset_similarities(
-        model, processor, non_member_df, args.attribute, temperatures, args.device, "Non-members"
-    )
-    
-    # Run attack
-    print(f"\n🔄 Running membership inference attack ({args.num_runs} runs)...")
-    aucs = []
-    attack_accs = []
-    tpr_at_5fprs = []
-    
-    for run_idx in range(args.num_runs):
-        auc, attack_acc, tpr_at_5fpr = target_only_inference(
-            member_similarities,
-            non_member_similarities,
-            args.granularity,
-            args.temperature_low,
-            args.temperature_high,
-            args.metric,
-            args.num_tests
-        )
-        aucs.append(auc)
-        attack_accs.append(attack_acc)
-        tpr_at_5fprs.append(tpr_at_5fpr)
-        print(f"   Run {run_idx + 1}/{args.num_runs}: AUC={auc:.4f}, Acc={attack_acc:.4f}, TPR@5%FPR={tpr_at_5fpr:.4f}")
-    
-    # Results
-    avg_auc = np.mean(aucs)
-    std_auc = np.std(aucs)
-    avg_acc = np.mean(attack_accs)
-    std_acc = np.std(attack_accs)
-    avg_tpr = np.mean(tpr_at_5fprs)
-    std_tpr = np.std(tpr_at_5fprs)
-    
-    print(f"\n{'='*60}")
-    print("📊 RESULTS")
-    print("="*60)
-    print(f"AUC:         {avg_auc:.4f} ± {std_auc:.4f}  (min: {min(aucs):.4f}, max: {max(aucs):.4f})")
-    print(f"Attack Acc:  {avg_acc:.4f} ± {std_acc:.4f}  (min: {min(attack_accs):.4f}, max: {max(attack_accs):.4f})")
-    print(f"TPR@5%FPR:   {avg_tpr:.4f} ± {std_tpr:.4f}  (min: {min(tpr_at_5fprs):.4f}, max: {max(tpr_at_5fprs):.4f})")
-    print("="*60)
-    
-    # Save results
-    os.makedirs(args.output, exist_ok=True)
-    
-    model_name = args.model_path.replace('/', '_').replace('\\', '_')
-    output_file = os.path.join(args.output, f"mia_{model_name}_{args.attribute}.json")
-    
-    results = {
-        'model': args.model_path,
-        'parameters': {
-            'attribute': args.attribute,
-            'member_data': args.member_data_dir,
-            'non_member_data': args.non_member_data_dir,
-            'member_samples': len(member_df),
-            'non_member_samples': len(non_member_df),
-            'temperature_low': args.temperature_low,
-            'temperature_high': args.temperature_high,
-            'granularity': args.granularity,
-            'metric': args.metric,
-            'num_runs': args.num_runs
-        },
-        'results': {
-            'auc': {
-                'values': aucs,
-                'mean': float(avg_auc),
-                'std': float(std_auc),
-                'min': float(min(aucs)),
-                'max': float(max(aucs))
-            },
-            'attack_accuracy': {
-                'values': attack_accs,
-                'mean': float(avg_acc),
-                'std': float(std_acc),
-                'min': float(min(attack_accs)),
-                'max': float(max(attack_accs))
-            },
-            'tpr_at_5fpr': {
-                'values': tpr_at_5fprs,
-                'mean': float(avg_tpr),
-                'std': float(std_tpr),
-                'min': float(min(tpr_at_5fprs)),
-                'max': float(max(tpr_at_5fprs))
-            }
-        }
-    }
-    
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\n💾 Results saved to: {output_file}")
-    print("\n✅ Attack complete!")
+    if len(member_data) == 0 or len(nonmember_data) == 0:
+        print("[Error] Failed to load data. Please check file paths.")
+        return
+    print("\n[Step 3] Compute metrics and evaluate MIA...")
+    # Parameters
+    attribute = "captions"  # For COCO caption, use the first caption as GT
+    temperatures = [0.7, 1.3]
+    metric = "f1"  # You can also use 'exact_match', 'contains', etc.
+    granularity = 5
+    num_tests = 1000
 
+    # Convert to DataFrame and use first caption as GT label
+    member_df = pd.DataFrame(member_data)
+    member_df["file"] = member_df["image_path"].apply(lambda x: os.path.basename(x))
+    member_df["caption"] = member_df["captions"].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else "")
+    nonmember_df = pd.DataFrame(nonmember_data)
+    nonmember_df["file"] = nonmember_df["image_path"].apply(lambda x: os.path.basename(x))
+    nonmember_df["caption"] = nonmember_df["captions"].apply(lambda x: x[0] if isinstance(x, list) and len(x) > 0 else "")
+
+    # Compute similarities for both datasets
+    member_results = compute_dataset_similarities(
+        model, processor, member_df, attribute="caption", temperatures=temperatures, device=DEVICE, dataset_name="member"
+    )
+    nonmember_results = compute_dataset_similarities(
+        model, processor, nonmember_df, attribute="caption", temperatures=temperatures, device=DEVICE, dataset_name="non-member"
+    )
+
+    # Run target-only inference attack
+    auc, attack_acc, tpr_at_5fpr = target_only_inference(
+        member_results, nonmember_results, granularity=granularity,
+        temperature_low=temperatures[0], temperature_high=temperatures[1],
+        metric=metric, num_tests=num_tests
+    )
+
+    print("\n=================== MIA Results ===================")
+    print(f"AUC: {auc:.4f}")
+    print(f"Attack Accuracy: {attack_acc:.4f}")
+    print(f"TPR@5%FPR: {tpr_at_5fpr:.4f}")
+    print("==================================================")
+
+    # Optionally save results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    pd.DataFrame(member_results).to_json(os.path.join(OUTPUT_DIR, "member_results.json"), orient="records", force_ascii=False)
+    pd.DataFrame(nonmember_results).to_json(os.path.join(OUTPUT_DIR, "nonmember_results.json"), orient="records", force_ascii=False)
+    with open(os.path.join(OUTPUT_DIR, "mia_metrics.txt"), "w") as f:
+        f.write(f"AUC: {auc:.4f}\nAttack Accuracy: {attack_acc:.4f}\nTPR@5%FPR: {tpr_at_5fpr:.4f}\n")
+    print(f"\n[Info] Results saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()

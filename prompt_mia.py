@@ -38,18 +38,21 @@ MODEL = "pali"  # "pali" for PaliGemma, "smol" for SmolVLM
 # Model configurations
 MODEL_CONFIGS = {
     "pali": {
-        "model_id": "google/paligemma-3b-ft-cococap-224",
+        "model_id": "google/paligemma-3b-pt-224",
         "model_class": PaliGemmaForConditionalGeneration,
-        "adapter_path": None,
+        "adapter_path": False,  # Set to merged model path if using merge_vlm.py output
+        "merged_model_path": "./models/merge_weights/pali_vqa_caption",  # Path to merged model
         "use_image_token": True,  # PaliGemma requires <image> token
-        "quantization": "8bit"
+        "quantization": "8bit",
+        "is_lora_adapter": False  # False if using full merged model from merge_vlm.py
     },
     "smol": {
         "model_id": "HuggingFaceTB/SmolVLM-500M-Instruct",
         "model_class": AutoModelForImageTextToText,
         "adapter_path": "./models/smolvlm-caption-finetune_3",  # LoRA adapter path
         "use_image_token": False,  # SmolVLM uses chat template
-        "quantization": "4bit"
+        "quantization": "4bit",
+        "is_lora_adapter": True  # True if using LoRA adapter
     }
 }
 
@@ -59,10 +62,10 @@ TRAIN_IMAGES_DIR = os.path.join(DATA_ROOT, "train2017")
 VAL_IMAGES_DIR = os.path.join(DATA_ROOT, "val2017")
 TRAIN_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_train2017.json")
 VAL_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_val2017.json")
-OUTPUT_DIR = "./mia_results"
+OUTPUT_DIR = "./attack_results/eval/0128/pali_merge_optimize"
 
 # Attack parameters
-PROMPT = "Describe this image."  # Prompt to use for MIA evaluation
+PROMPT = "Describe breach Remedies pige."  # Prompt to use for MIA evaluation
 
 # Renyi entropy parameter (α=2 for collision entropy, as used in NeurIPS 2024 paper)
 # Paper tests α = 0.5, 1, 2, ∞ and K = 0, 10, 100
@@ -138,21 +141,38 @@ def load_model_and_processor(model_type):
     """Load model and processor based on model type."""
     config = MODEL_CONFIGS[model_type]
     model_id = config["model_id"]
-    adapter_path = config["adapter_path"]
-    
+    is_lora_adapter = config.get("is_lora_adapter", False)
+    merged_model_path = config.get("merged_model_path", None)
+    adapter_path = config.get("adapter_path", None)
+
     print(f"[Info] Loading model: {model_id} (type: {model_type})")
-    
-    # Load processor
-    if adapter_path and os.path.exists(adapter_path):
-        try:
-            processor = AutoProcessor.from_pretrained(adapter_path)
-            print(f"[Info] Loaded processor from adapter path")
-        except:
-            processor = AutoProcessor.from_pretrained(model_id)
-            print(f"[Info] Loaded processor from base model")
+
+    if is_lora_adapter:
+        # LoRA adapter: load base model, then adapter
+        load_path = model_id
+        print(f"[Info] Will load LoRA adapter from: {adapter_path}")
+    elif merged_model_path and os.path.exists(merged_model_path):
+        # Merged model: load directly
+        load_path = merged_model_path
+        print(f"[Info] Using merged model from: {merged_model_path}")
     else:
+        # No adapter or merged model: use base model
+        load_path = model_id
+        if merged_model_path:
+            print(f"[Warning] Merged model path not found: {merged_model_path}")
+        print(f"[Info] Using base model")
+
+    # Load processor
+    try:
+        processor = AutoProcessor.from_pretrained(
+            merged_model_path if (not is_lora_adapter and merged_model_path and os.path.exists(merged_model_path))
+            else (adapter_path if is_lora_adapter and adapter_path and os.path.exists(adapter_path) else model_id)
+        )
+        print(f"[Info] Loaded processor")
+    except:
         processor = AutoProcessor.from_pretrained(model_id)
-    
+        print(f"[Info] Loaded processor from base model")
+
     # Configure quantization based on model
     if config["quantization"] == "8bit":
         quantization_config = BitsAndBytesConfig(
@@ -166,31 +186,58 @@ def load_model_and_processor(model_type):
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
-    
-    # Load base model
+
+
+
+    # Load model
     model_class = config["model_class"]
-    base_model = model_class.from_pretrained(
-        model_id,
-        quantization_config=quantization_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16 if config["quantization"] == "4bit" else torch.float16
-    )
-    
-    # Load adapter if specified (for SmolVLM)
-    if adapter_path and os.path.exists(adapter_path):
-        print(f"[Info] Loading LoRA adapter from {adapter_path}...")
-        model = PeftModel.from_pretrained(base_model, adapter_path)
-        model = model.merge_and_unload()
-        print("[Info] Adapter loaded and merged")
+    try:
+        if not is_lora_adapter and merged_model_path and os.path.exists(merged_model_path):
+            # Merged model: load base model, but use merged weights
+            safetensors_path = os.path.join(merged_model_path, "model.safetensors")
+            bin_path = os.path.join(merged_model_path, "pytorch_model.bin")
+            if os.path.exists(safetensors_path):
+                weights_path = safetensors_path
+            elif os.path.exists(bin_path):
+                weights_path = bin_path
+            else:
+                raise FileNotFoundError(f"Merged model weights not found: {safetensors_path} or {bin_path}")
+            print(f"[Info] Loading merged weights from: {weights_path}")
+            base_model = model_class.from_pretrained(
+                merged_model_path,
+                quantization_config=quantization_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16 if config["quantization"] == "4bit" else torch.float16
+            )
+        else:
+            base_model = model_class.from_pretrained(
+                load_path,
+                quantization_config=quantization_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16 if config["quantization"] == "4bit" else torch.float16
+            )
+    except Exception as e:
+        print(f"[Error] Failed to load model from {load_path} with model_class {model_class}: {e}")
+        print("[Hint] If this is a merged model, ensure model_class is correct (e.g., AutoModelForXXX). If this is a LoRA adapter, check adapter_path and is_lora_adapter.")
+        raise
+
+
+    # Only use PeftModel for LoRA adapters
+    if is_lora_adapter and adapter_path and os.path.exists(adapter_path):
+        try:
+            print(f"[Info] Loading LoRA adapter from {adapter_path}...")
+            model = PeftModel.from_pretrained(base_model, adapter_path)
+            model = model.merge_and_unload()
+            print("[Info] Adapter loaded and merged")
+        except Exception as e:
+            print(f"[Error] Failed to load LoRA adapter: {e}")
+            raise
     else:
-        if adapter_path:
-            print(f"[Warning] Adapter path not found: {adapter_path}")
-        print(f"[Info] Using base model only")
         model = base_model
-    
+
     model.eval()
     print(f"[Info] Model loaded successfully")
-    
+
     return model, processor
 
 # -----------------------------------------------------------------------------
@@ -246,7 +293,9 @@ def compute_generation_entropy(model, processor, image_path, prompt, device, mod
                 top_p=TOP_P,
                 top_k=TOP_K if TOP_K > 0 else None,
                 return_dict_in_generate=True,
-                output_scores=True
+                output_scores=True,
+                pad_token_id=processor.tokenizer.pad_token_id if hasattr(processor, 'tokenizer') else None,
+                eos_token_id=processor.tokenizer.eos_token_id if hasattr(processor, 'tokenizer') else None
             )
         
         # Compute Renyi entropy from logits

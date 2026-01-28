@@ -2,5 +2,5 @@
 *.png
 *.bat
 
-weights/*
-results/*
+attack_results/*
+models/*

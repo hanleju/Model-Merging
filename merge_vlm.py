@@ -402,21 +402,25 @@ def main():
     )
     
     # Required arguments
-    parser.add_argument("--base_model", type=str, required=True,
-                       help="Base/pretrained model path")
-    parser.add_argument("--model_a", type=str, required=True,
-                       help="First fine-tuned model path")
-    parser.add_argument("--model_b", type=str, required=True,
-                       help="Second fine-tuned model path")
-    parser.add_argument("--output", type=str, required=True,
-                       help="Output directory for merged model")
+    parser.add_argument("--base_model", type=str, 
+                       default="google/paligemma-3b-pt-224",
+                       help="Base/pretrained model path (default: google/paligemma-3b-pt-224)")
+    parser.add_argument("--model_a", type=str,
+                       default="google/paligemma-3b-ft-cococap-224",
+                       help="First fine-tuned model path (default: google/paligemma-3b-ft-cococap-224)")
+    parser.add_argument("--model_b", type=str,
+                       default="google/paligemma-3b-ft-vqav2-224",
+                       help="Second fine-tuned model path (default: google/paligemma-3b-ft-vqav2-224)")
+    parser.add_argument("--output", type=str,
+                       default="./merge_weights",
+                       help="Output directory for merged model (default: ./merge_weights)")
     
     # Merging configuration
     parser.add_argument("--mode", type=str, default="ties",
                        choices=["base", "layerswap", "ties", "dareties", "darelinear"],
                        help="Merging mode (default: ties)")
-    parser.add_argument("--alpha", type=float, default=1.0,
-                       help="Weight for model A (default: 1.0)")
+    parser.add_argument("--alpha", type=float, default=0.5,
+                       help="Weight for model A (default: 0.5)")
     parser.add_argument("--alpha2", type=float, default=None,
                        help="Weight for model B (default: 1-alpha)")
     parser.add_argument("--density", type=float, default=0.3,

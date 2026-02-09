@@ -32,12 +32,12 @@ DATA_ROOT = "D:/datasets/coco/"
 VAL_IMAGES_DIR = os.path.join(DATA_ROOT, "val2017")
 TEST_IMAGES_DIR = os.path.join(DATA_ROOT, "test2017")
 VAL_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_val2017.json")
-OUTPUT_DIR = "./attack_results/beast_attack/"
+OUTPUT_DIR = "./attack_results/tuning/0129"
 
 # Attack parameters
 INITIAL_PROMPT = "Describe this image."
 NUM_ITERATIONS = 50  # Reduced for faster experiments
-NUM_CANDIDATES = 30  # Number of token candidates to try per position
+NUM_CANDIDATES = 50  # Number of token candidates to try per position
 BATCH_SIZE = 16  # Number of images to evaluate per iteration
 BEAM_WIDTH = 5  # Number of best prompts to keep (BEAST algorithm)
 

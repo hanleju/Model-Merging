@@ -38,10 +38,10 @@ MODEL = "pali"  # "pali" for PaliGemma, "smol" for SmolVLM
 # Model configurations
 MODEL_CONFIGS = {
     "pali": {
-        "model_id": "google/paligemma-3b-pt-224",
+        "model_id": "google/paligemma-3b-ft-cococap-224",
         "model_class": PaliGemmaForConditionalGeneration,
         "adapter_path": False,  # Set to merged model path if using merge_vlm.py output
-        "merged_model_path": "./models/merge_weights/pali_vqa_caption",  # Path to merged model
+        "merged_model_path": False,  # Path to merged model
         "use_image_token": True,  # PaliGemma requires <image> token
         "quantization": "8bit",
         "is_lora_adapter": False  # False if using full merged model from merge_vlm.py
@@ -62,10 +62,10 @@ TRAIN_IMAGES_DIR = os.path.join(DATA_ROOT, "train2017")
 VAL_IMAGES_DIR = os.path.join(DATA_ROOT, "val2017")
 TRAIN_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_train2017.json")
 VAL_ANNOTATION_FILE = os.path.join(DATA_ROOT, "annotations/captions_val2017.json")
-OUTPUT_DIR = "./attack_results/eval/0128/pali_merge_optimize"
+OUTPUT_DIR = "./attack_results/eval/0129/pali_optimize"
 
 # Attack parameters
-PROMPT = "Describe breach Remedies pige."  # Prompt to use for MIA evaluation
+PROMPT = "Describe podsione interpreter."  # Prompt to use for MIA evaluation
 
 # Renyi entropy parameter (α=2 for collision entropy, as used in NeurIPS 2024 paper)
 # Paper tests α = 0.5, 1, 2, ∞ and K = 0, 10, 100
@@ -76,7 +76,7 @@ RENYI_ALPHA = 2.0
 MAX_K_PERCENT = 100  # Use average entropy (K=100)
 
 NUM_EVAL_SAMPLES = 500  # Number of samples to evaluate (per class)
-MAX_NEW_TOKENS = 40
+MAX_NEW_TOKENS = 50
 TEMPERATURE = 1.0  # Use sampling to compute entropy
 DO_SAMPLE = True
 TOP_P = 1.0
